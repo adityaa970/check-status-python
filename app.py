@@ -1,7 +1,7 @@
 import requests
 from datetime import datetime
 import json
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 import time
 import re
 import os
@@ -12,6 +12,7 @@ app = Flask(__name__)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL") or "https://cuqnpzoldeiztgezwqqe.supabase.co"
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImN1cW5wem9sZGVpenRnZXp3cXFlIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MTMwOTM3OSwiZXhwIjoyMDc2ODg1Mzc5fQ.Ltm4bRsX8UBOG5XuXLEciniGohs1Bvz6iHoPJqT8k8I"
+DEFAULT_NOTIFICATION_URL = "https://telegram-js-xi.vercel.app"
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise ValueError("Missing Supabase environment variables")
@@ -109,7 +110,7 @@ def get_or_create_app(app_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     except Exception as e:
         return None
 
-def update_app_status(app_data: Dict[str, Any]) -> bool:
+def update_app_status(app_data: Dict[str, Any]) -> Dict[str, Any]:
     sanitized_name = sanitize_string(app_data['name'])
     
     try:
@@ -117,13 +118,19 @@ def update_app_status(app_data: Dict[str, Any]) -> bool:
         
         if not result.data:
             get_or_create_app(app_data)
-            return True
+            return {'updated': True, 'status_changed': False, 'previous_status': None}
         
         current_app = result.data[0]
+        previous_status = current_app.get('betaAvailable', 'unknown')
         
         if (current_app.get('clickCount', 0) == app_data['clickCount'] and 
             current_app.get('betaAvailable', 'unknown') == app_data['betaAvailable']):
-            return False
+            return {'updated': False, 'status_changed': False, 'previous_status': previous_status}
+        
+        status_changed_to_open = (
+            previous_status in ['full', 'not accepting', 'error', 'timeout', 'unknown'] and 
+            app_data['betaAvailable'] == 'open'
+        )
         
         update_data = {
             'betaAvailable': app_data['betaAvailable'],
@@ -155,14 +162,82 @@ def update_app_status(app_data: Dict[str, Any]) -> bool:
             if old_ids:
                 supabase.table('app_history').delete().in_('id', old_ids).execute()
         
-        return True
+        return {
+            'updated': True, 
+            'status_changed': status_changed_to_open, 
+            'previous_status': previous_status,
+            'current_status': app_data['betaAvailable'],
+            'click_count': app_data['clickCount'],
+            'name': app_data['name']
+        }
+        
+    except Exception as e:
+        return {'updated': False, 'status_changed': False, 'previous_status': None}
+
+def check_if_notification_sent(app_name: str, current_status: str, previous_status: str) -> bool:
+    """Check if a notification was already sent for this specific status change"""
+    try:
+        sanitized_name = sanitize_string(app_name)
+        result = supabase.table('telegram_posts')\
+            .select('timestamp, version')\
+            .eq('appname', app_name)\
+            .execute()
+        
+        if not result.data:
+            return False
+        
+        last_post = result.data[0]
+        last_version = last_post.get('version', '')
+        
+        # Check if we already sent a notification for this specific status change
+        status_change_pattern = f'python_status_change_{previous_status}_to_{current_status}'
+        if status_change_pattern in last_version:
+            return True
+            
+        return False
         
     except Exception as e:
         return False
 
+def record_notification_sent(app_name: str, current_status: str, previous_status: str) -> None:
+    """Record that a notification was sent for this app status change"""
+    try:
+        version = f'python_status_change_{previous_status}_to_{current_status}_{datetime.utcnow().isoformat()}'
+        supabase.table('telegram_posts').upsert({
+            'appname': app_name,
+            'timestamp': datetime.utcnow().isoformat(),
+            'version': version
+        }, {
+            'onConflict': 'appname'
+        }).execute()
+    except Exception as e:
+        pass
+
+def send_telegram_notification(apps_to_notify: list, base_url: str = DEFAULT_NOTIFICATION_URL) -> Dict[str, Any]:
+    try:
+        if not apps_to_notify:
+            return {'success': False, 'message': 'No apps to notify'}
+        
+        api_url = f"{base_url}/api/sendTelegramFromPython"
+        
+        payload = {
+            'apps': apps_to_notify
+        }
+        
+        response = requests.post(api_url, json=payload, timeout=30)
+        
+        if response.status_code == 200:
+            return {'success': True, 'data': response.json(), 'sent_count': len(apps_to_notify)}
+        else:
+            return {'success': False, 'error': f'HTTP {response.status_code}', 'response': response.text}
+            
+    except requests.exceptions.RequestException as e:
+        return {'success': False, 'error': str(e)}
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
 def get_user_interactions() -> Dict[str, int]:
     try:
-        # Use smaller chunks and limit results to save memory
         result = supabase.table('user_interactions')\
             .select('sanitizedName, clickCount')\
             .limit(1000)\
@@ -172,47 +247,13 @@ def get_user_interactions() -> Dict[str, int]:
         for item in result.data:
             interactions[item['sanitizedName']] = item['clickCount']
         
-        # Clear result from memory
         del result
         
         return interactions
     except Exception as e:
         return {}
 
-def debug_app_matching(json_url: str) -> Dict[str, Any]:
-    try:
-        response = requests.get(json_url, timeout=30)
-        response.raise_for_status()
-        data = response.json()
-        apps = data[0]['apps']
-        
-        user_interactions = get_user_interactions()
-        
-        json_apps = {}
-        for app in apps:
-            sanitized = sanitize_string(app['name'])
-            json_apps[sanitized] = app['name']
-        
-        matches = []
-        missing = []
-        
-        for tracked_name, clicks in user_interactions.items():
-            if tracked_name in json_apps:
-                matches.append((tracked_name, json_apps[tracked_name], clicks))
-            else:
-                missing.append((tracked_name, clicks))
-        
-        return {
-            "matches": len(matches),
-            "missing": len(missing),
-            "total_tracked": len(user_interactions),
-            "total_json": len(apps),
-            "match_details": matches,
-            "missing_details": missing
-        }
-        
-    except Exception as e:
-        return {"error": str(e)}
+
 
 def get_processing_index(counter_key: str) -> int:
     try:
@@ -237,23 +278,19 @@ def update_processing_index(counter_key: str, last_checked: int) -> None:
     except Exception as e:
         pass
 
-def process_apps_from_json(json_url: str, click_threshold: int, counter_key: str, max_apps_to_process: int = 1) -> Dict[str, Any]:
+def process_apps_from_json(json_url: str, click_threshold: int, counter_key: str, max_apps_to_process: int = 1, send_notifications: bool = False, notification_base_url: str = DEFAULT_NOTIFICATION_URL) -> Dict[str, Any]:
     try:
-        # Reduce timeout to prevent memory buildup
         response = requests.get(json_url, timeout=10, stream=True)
         response.raise_for_status()
         
-        # Parse JSON in smaller chunks to save memory
         data = response.json()
         
-        # Clear response from memory immediately
         response.close()
         del response
 
         if not data or 'apps' not in data[0]:
             raise Exception('No app data found to process.')
 
-        # Get user interactions with limit to reduce memory
         user_interactions = get_user_interactions()
         
         if not user_interactions:
@@ -265,55 +302,86 @@ def process_apps_from_json(json_url: str, click_threshold: int, counter_key: str
         count = 0
         checked = 0
         apps_below_threshold = 0
+        apps_to_notify = []
 
-        # Process only a small number of apps to stay within memory limits
-        max_check_limit = min(max_apps_to_process * 10, 20)  # Max 20 apps checked
+        max_check_limit = min(max_apps_to_process * 10, 20)
         
         while count < max_apps_to_process and checked < max_check_limit and checked < total_apps:
             app_index = (start_index + checked) % total_apps
-            app = data[0]['apps'][app_index].copy()  # Make a copy to avoid modifying original
+            app = data[0]['apps'][app_index].copy()
             sanitized_app_name = sanitize_string(app['name'])
             app['clickCount'] = user_interactions.get(sanitized_app_name, 0)
 
             if app['clickCount'] >= click_threshold:
                 app['betaAvailable'] = fetch_beta_availability(app['link'])
-                if update_app_status(app):
-                    count += 1
+                update_result = update_app_status(app)
                 
-                # Force garbage collection after processing each app
+                if update_result['updated']:
+                    count += 1
+                    
+                    # Only send notification if status changed to open AND we haven't already notified about this change
+                    if (send_notifications and 
+                        update_result['status_changed'] and 
+                        update_result['current_status'] == 'open' and
+                        not check_if_notification_sent(
+                            app['name'], 
+                            update_result['current_status'], 
+                            update_result['previous_status']
+                        )):
+                        
+                        apps_to_notify.append({
+                            'name': app['name'],
+                            'clickCount': app['clickCount'],
+                            'betaAvailable': app['betaAvailable'],
+                            'previousStatus': update_result['previous_status']
+                        })
+                        
+                        # Record that we're about to send a notification for this change
+                        record_notification_sent(
+                            app['name'],
+                            update_result['current_status'],
+                            update_result['previous_status']
+                        )
+                
                 import gc
                 gc.collect()
-                
-                # Longer delay to prevent memory buildup
                 time.sleep(1.0)
             else:
                 apps_below_threshold += 1
 
             checked += 1
-            
-            # Clear app data from memory
             del app
 
-        # Clear large data structures from memory
+        notification_result = None
+        if send_notifications and apps_to_notify:
+            notification_result = send_telegram_notification(apps_to_notify, notification_base_url)
+
         del data
         del user_interactions
         
-        # Force garbage collection
         import gc
         gc.collect()
 
         new_last_checked_index = (start_index + checked) % total_apps
         update_processing_index(counter_key, new_last_checked_index)
 
-        return {"message": f"Processed {count} apps for {counter_key}.", "details": {
-            "checked": checked,
-            "processed": count,
-            "below_threshold": apps_below_threshold,
-            "click_threshold": click_threshold
-        }}
+        result = {
+            "message": f"Processed {count} apps for {counter_key}.", 
+            "details": {
+                "checked": checked,
+                "processed": count,
+                "below_threshold": apps_below_threshold,
+                "click_threshold": click_threshold,
+                "notifications_sent": len(apps_to_notify) if apps_to_notify else 0
+            }
+        }
+        
+        if notification_result:
+            result["notification_result"] = notification_result
+            
+        return result
         
     except Exception as e:
-        # Force garbage collection on error
         import gc
         gc.collect()
         return {"error": str(e)}
@@ -323,7 +391,7 @@ def parse_markdown(markdown_content: str) -> list:
     matches = re.findall(app_pattern, markdown_content)
     return [{"name": match[0], "logo": match[1], "link": match[2]} for match in matches]
 
-def process_apps(file_url: str, click_threshold: int, counter_key: str) -> Dict[str, Any]:
+def process_apps(file_url: str, click_threshold: int, counter_key: str, send_notifications: bool = False, notification_base_url: str = DEFAULT_NOTIFICATION_URL) -> Dict[str, Any]:
     try:
         response = requests.get(file_url, timeout=30)
         if not response.text:
@@ -339,6 +407,7 @@ def process_apps(file_url: str, click_threshold: int, counter_key: str) -> Dict[
         last_checked = get_processing_index(counter_key)
         start_index = last_checked
         count = 0
+        apps_to_notify = []
 
         for i in range(start_index, start_index + 20):
             app_index = i % len(data)
@@ -348,13 +417,54 @@ def process_apps(file_url: str, click_threshold: int, counter_key: str) -> Dict[
 
             if app['clickCount'] >= click_threshold:
                 app['betaAvailable'] = fetch_beta_availability(app['link'])
-                if update_app_status(app):
+                update_result = update_app_status(app)
+                
+                if update_result['updated']:
                     count += 1
+                    
+                    # Only send notification if status changed to open AND we haven't already notified about this change
+                    if (send_notifications and 
+                        update_result['status_changed'] and 
+                        update_result['current_status'] == 'open' and
+                        not check_if_notification_sent(
+                            app['name'], 
+                            update_result['current_status'], 
+                            update_result['previous_status']
+                        )):
+                        
+                        apps_to_notify.append({
+                            'name': app['name'],
+                            'clickCount': app['clickCount'],
+                            'betaAvailable': app['betaAvailable'],
+                            'previousStatus': update_result['previous_status']
+                        })
+                        
+                        # Record that we're about to send a notification for this change
+                        record_notification_sent(
+                            app['name'],
+                            update_result['current_status'],
+                            update_result['previous_status']
+                        )
+
+        notification_result = None
+        if send_notifications and apps_to_notify:
+            notification_result = send_telegram_notification(apps_to_notify, notification_base_url)
 
         new_last_checked_index = (start_index + 20) % len(data)
         update_processing_index(counter_key, new_last_checked_index)
 
-        return {"message": f"App statuses updated successfully for {counter_key}."}
+        result = {
+            "message": f"App statuses updated successfully for {counter_key}.",
+            "details": {
+                "processed": count,
+                "notifications_sent": len(apps_to_notify) if apps_to_notify else 0
+            }
+        }
+        
+        if notification_result:
+            result["notification_result"] = notification_result
+            
+        return result
         
     except Exception as e:
         return {"error": str(e)}
@@ -362,141 +472,96 @@ def process_apps(file_url: str, click_threshold: int, counter_key: str) -> Dict[
 @app.route('/check_apps', methods=['GET'])
 def check_apps():
     json_file = 'https://raw.githubusercontent.com/aditya9738d/codewings_files/main/codewingiTune.json'
-    result = process_apps_from_json(json_file, click_threshold=50, counter_key='lastChecked_check_apps', max_apps_to_process=3)
+    notification_url = request.args.get('notification_url', DEFAULT_NOTIFICATION_URL)
+    
+    result = process_apps_from_json(
+        json_file, 
+        click_threshold=20, 
+        counter_key='lastChecked_check_apps', 
+        max_apps_to_process=3,
+        send_notifications=True,
+        notification_base_url=notification_url
+    )
+    return jsonify(result)
+
+@app.route('/check_apps_with_notifications', methods=['GET'])
+def check_apps_with_notifications():
+    json_file = 'https://raw.githubusercontent.com/aditya9738d/codewings_files/main/codewingiTune.json'
+    notification_url = request.args.get('notification_url', DEFAULT_NOTIFICATION_URL)
+    
+    result = process_apps_from_json(
+        json_file, 
+        click_threshold=10, 
+        counter_key='lastChecked_with_notifications', 
+        max_apps_to_process=3,
+        send_notifications=True,
+        notification_base_url=notification_url
+    )
     return jsonify(result)
 
 @app.route('/check_all', methods=['GET'])
 def check_all():
     json_file = 'https://raw.githubusercontent.com/aditya9738d/codewings_files/main/codewingiTune.json'
-    result = process_apps_from_json(json_file, click_threshold=0, counter_key='lastChecked_check_all', max_apps_to_process=3)
+    notification_url = request.args.get('notification_url', DEFAULT_NOTIFICATION_URL)
+    
+    result = process_apps_from_json(
+        json_file, 
+        click_threshold=0, 
+        counter_key='lastChecked_check_all', 
+        max_apps_to_process=3,
+        send_notifications=True,
+        notification_base_url=notification_url
+    )
     return jsonify(result)
 
 @app.route('/daily_stat', methods=['GET'])
 def daily_stat():
     file_url = 'https://raw.githubusercontent.com/aditya9738d/codewings_files/main/daily-next.md'
-    result = process_apps(file_url, click_threshold=0, counter_key='lastChecked_dailyNext')
+    notification_url = request.args.get('notification_url', DEFAULT_NOTIFICATION_URL)
+    
+    result = process_apps(
+        file_url, 
+        click_threshold=0, 
+        counter_key='lastChecked_dailyNext',
+        send_notifications=True,
+        notification_base_url=notification_url
+    )
     return jsonify(result)
 
 @app.route('/health', methods=['GET'])
 def health():
-    # Force garbage collection on health check
     import gc
     gc.collect()
     return jsonify({
         "status": "healthy", 
-        "timestamp": datetime.utcnow().isoformat(),
-        "memory_efficient": True,
-        "render_optimized": True
+        "timestamp": datetime.utcnow().isoformat()
     })
 
 @app.route('/keep_alive', methods=['GET'])
 def keep_alive():
-    # Force garbage collection on keep alive
     import gc
     gc.collect()
     return jsonify({
         "status": "alive",
-        "timestamp": datetime.utcnow().isoformat(),
-        "uptime_strategy": "render_free_tier"
+        "timestamp": datetime.utcnow().isoformat()
     })
 
 @app.route('/quick_check', methods=['GET'])
 def quick_check():
     json_file = 'https://raw.githubusercontent.com/aditya9738d/codewings_files/main/codewingiTune.json'
-    result = process_apps_from_json(json_file, click_threshold=10, counter_key='lastChecked_quick', max_apps_to_process=1)
+    notification_url = request.args.get('notification_url', DEFAULT_NOTIFICATION_URL)
+    
+    result = process_apps_from_json(
+        json_file, 
+        click_threshold=10, 
+        counter_key='lastChecked_quick', 
+        max_apps_to_process=3,
+        send_notifications=True,
+        notification_base_url=notification_url
+    )
     return jsonify(result)
 
-@app.route('/debug_matching')
-def debug_matching():
-    json_url = "https://raw.githubusercontent.com/aditya9738d/codewings_files/main/codewingiTune.json"
-    result = debug_app_matching(json_url)
-    return jsonify(result)
 
-@app.route('/add_real_app_for_testing/<app_name>')
-def add_real_app_for_testing(app_name: str):
-    try:
-        json_url = "https://raw.githubusercontent.com/aditya9738d/codewings_files/main/codewingiTune.json"
-        response = requests.get(json_url, timeout=30)
-        response.raise_for_status()
-        data = response.json()
-        apps = data[0]['apps']
-        
-        found_app = None
-        for app in apps:
-            if app['name'].lower() == app_name.lower():
-                found_app = app
-                break
-        
-        if not found_app:
-            return jsonify({"error": f"App '{app_name}' not found in JSON"}), 404
-        
-        sanitized_name = sanitize_string(found_app['name'])
-        
-        try:
-            result = supabase.table('user_interactions')\
-                .update({'clickCount': 5})\
-                .eq('sanitizedName', sanitized_name)\
-                .execute()
-            
-            if not result.data:
-                supabase.table('user_interactions').insert({
-                    'sanitizedName': sanitized_name,
-                    'clickCount': 5
-                }).execute()
-        except Exception as e:
-            supabase.table('user_interactions')\
-                .update({'clickCount': 5})\
-                .eq('sanitizedName', sanitized_name)\
-                .execute()
-        
-        return jsonify({
-            "success": True,
-            "message": f"Added '{found_app['name']}' with 5 clicks",
-            "sanitizedName": sanitized_name,
-            "originalName": found_app['name']
-        })
-        
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/test_with_sample_data', methods=['GET'])
-def test_with_sample_data():
-    try:
-        sample_interactions = [
-            ("TestApp1", "testapp1", 25),
-            ("TestApp2", "testapp2", 10),
-            ("TestApp3", "testapp3", 100),
-            ("PopularApp", "popularapp", 75),
-            ("NewApp", "newapp", 3)
-        ]
-        
-        for app_name, sanitized_name, click_count in sample_interactions:
-            try:
-                result = supabase.table('user_interactions')\
-                    .update({'clickCount': click_count, 'appName': app_name})\
-                    .eq('sanitizedName', sanitized_name)\
-                    .execute()
-                
-                if not result.data:
-                    supabase.table('user_interactions').insert({
-                        'appName': app_name,
-                        'sanitizedName': sanitized_name,
-                        'clickCount': click_count
-                    }).execute()
-                    
-            except Exception as e:
-                pass
-        
-        return jsonify({
-            "message": "Sample user interaction data created",
-            "sample_data": [
-                {"name": name, "clicks": clicks} for name, _, clicks in sample_interactions
-            ],
-            "next_step": "Now try: curl http://127.0.0.1:5000/check_all"
-        })
-        
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
