@@ -128,7 +128,7 @@ def update_app_status(app_data: Dict[str, Any]) -> Dict[str, Any]:
             return {'updated': False, 'status_changed': False, 'previous_status': previous_status}
         
         status_changed_to_open = (
-            previous_status in ['full', 'not accepting', 'error', 'timeout', 'unknown'] and 
+            previous_status in ['full', 'not accepting', 'error', 'unknown'] and 
             app_data['betaAvailable'] == 'open'
         )
         
