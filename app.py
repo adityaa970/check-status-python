@@ -137,6 +137,7 @@ def update_app_status(app_data: Dict[str, Any]) -> Dict[str, Any]:
             'clickCount': app_data['clickCount'],
             'link': app_data['link'],
             'logo': app_data['logo'],
+            'screenshotUrls': app_data.get('screenshotUrls', []),
             'lastChecked': datetime.utcnow().isoformat()
         }
         
@@ -278,6 +279,109 @@ def update_processing_index(counter_key: str, last_checked: int) -> None:
     except Exception as e:
         pass
 
+def process_apps_from_api(api_url: str, click_threshold: int, counter_key: str, max_apps_to_process: int = 1, send_notifications: bool = False, notification_base_url: str = DEFAULT_NOTIFICATION_URL) -> Dict[str, Any]:
+    try:
+        response = requests.get(api_url, timeout=10)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        response.close()
+        del response
+
+        if not data or 'apps' not in data:
+            raise Exception('No app data found to process.')
+
+        apps_data = data['apps']
+        
+        start_index = get_processing_index(counter_key)
+        
+        total_apps = len(apps_data)
+        count = 0
+        checked = 0
+        apps_below_threshold = 0
+        apps_to_notify = []
+
+        max_check_limit = min(max_apps_to_process * 5, total_apps)
+        
+        while count < max_apps_to_process and checked < max_check_limit and checked < total_apps:
+            app_index = (start_index + checked) % total_apps
+            app = apps_data[app_index].copy()
+
+            if app['clickCount'] >= click_threshold:
+                # App already has betaAvailable status from API, but let's check it fresh
+                app['betaAvailable'] = fetch_beta_availability(app['link'])
+                update_result = update_app_status(app)
+                
+                count += 1  # Count all qualifying apps, not just updated ones
+                
+                if update_result['updated']:
+                    # Only send notification if status changed to open AND we haven't already notified about this change
+                    if (send_notifications and 
+                        update_result['status_changed'] and 
+                        update_result['current_status'] == 'open' and
+                        not check_if_notification_sent(
+                            app['name'], 
+                            update_result['current_status'], 
+                            update_result['previous_status']
+                        )):
+                        
+                        apps_to_notify.append({
+                            'name': app['name'],
+                            'clickCount': app['clickCount'],
+                            'betaAvailable': app['betaAvailable'],
+                            'previousStatus': update_result['previous_status']
+                        })
+                        
+                        # Record that we're about to send a notification for this change
+                        record_notification_sent(
+                            app['name'],
+                            update_result['current_status'],
+                            update_result['previous_status']
+                        )
+                
+                import gc
+                gc.collect()
+                time.sleep(1.0)
+            else:
+                apps_below_threshold += 1
+
+            checked += 1
+            del app
+
+        notification_result = None
+        if send_notifications and apps_to_notify:
+            notification_result = send_telegram_notification(apps_to_notify, notification_base_url)
+
+        del data
+        
+        import gc
+        gc.collect()
+
+        new_last_checked_index = (start_index + checked) % total_apps
+        update_processing_index(counter_key, new_last_checked_index)
+
+        result = {
+            "message": f"Processed {count} apps for {counter_key}.", 
+            "details": {
+                "checked": checked,
+                "processed": count,
+                "below_threshold": apps_below_threshold,
+                "click_threshold": click_threshold,
+                "notifications_sent": len(apps_to_notify) if apps_to_notify else 0
+            }
+        }
+        
+        if notification_result:
+            result["notification_result"] = notification_result
+            
+        return result
+        
+    except Exception as e:
+        import gc
+        gc.collect()
+        return {"error": str(e)}
+
 def process_apps_from_json(json_url: str, click_threshold: int, counter_key: str, max_apps_to_process: int = 1, send_notifications: bool = False, notification_base_url: str = DEFAULT_NOTIFICATION_URL) -> Dict[str, Any]:
     try:
         response = requests.get(json_url, timeout=10, stream=True)
@@ -304,7 +408,7 @@ def process_apps_from_json(json_url: str, click_threshold: int, counter_key: str
         apps_below_threshold = 0
         apps_to_notify = []
 
-        max_check_limit = min(max_apps_to_process * 10, 20)
+        max_check_limit = min(max_apps_to_process * 5, total_apps)
         
         while count < max_apps_to_process and checked < max_check_limit and checked < total_apps:
             app_index = (start_index + checked) % total_apps
@@ -316,9 +420,9 @@ def process_apps_from_json(json_url: str, click_threshold: int, counter_key: str
                 app['betaAvailable'] = fetch_beta_availability(app['link'])
                 update_result = update_app_status(app)
                 
+                count += 1  # Count all qualifying apps, not just updated ones
+                
                 if update_result['updated']:
-                    count += 1
-                    
                     # Only send notification if status changed to open AND we haven't already notified about this change
                     if (send_notifications and 
                         update_result['status_changed'] and 
@@ -366,7 +470,7 @@ def process_apps_from_json(json_url: str, click_threshold: int, counter_key: str
         update_processing_index(counter_key, new_last_checked_index)
 
         result = {
-            "message": f"Processed {count} apps for {counter_key}.", 
+            "message": f"Processed {count} qualifying apps for {counter_key}.", 
             "details": {
                 "checked": checked,
                 "processed": count,
@@ -469,16 +573,51 @@ def process_apps(file_url: str, click_threshold: int, counter_key: str, send_not
     except Exception as e:
         return {"error": str(e)}
 
+@app.route('/check_supabase_api', methods=['GET'])
+def check_supabase_api():
+    api_url = 'https://telegram-js-xi.vercel.app/api/codewingFinalSupabase?cct=20'
+    notification_url = request.args.get('notification_url', DEFAULT_NOTIFICATION_URL)
+    
+    try:
+        click_threshold = int(request.args.get('click_threshold', '20'))
+    except (ValueError, TypeError):
+        click_threshold = 20
+        
+    try:
+        max_apps_to_process = int(request.args.get('max_apps_to_process', '3'))
+    except (ValueError, TypeError):
+        max_apps_to_process = 3
+    
+    result = process_apps_from_api(
+        api_url, 
+        click_threshold=click_threshold, 
+        counter_key='lastChecked_supabase_api', 
+        max_apps_to_process=max_apps_to_process,
+        send_notifications=True,
+        notification_base_url=notification_url
+    )
+    return jsonify(result)
+
 @app.route('/check_apps', methods=['GET'])
 def check_apps():
     json_file = 'https://raw.githubusercontent.com/aditya9738d/codewings_files/main/codewingiTune.json'
     notification_url = request.args.get('notification_url', DEFAULT_NOTIFICATION_URL)
     
+    try:
+        click_threshold = int(request.args.get('click_threshold', '20'))
+    except (ValueError, TypeError):
+        click_threshold = 20
+        
+    try:
+        max_apps_to_process = int(request.args.get('max_apps_to_process', '3'))
+    except (ValueError, TypeError):
+        max_apps_to_process = 3
+    
     result = process_apps_from_json(
         json_file, 
-        click_threshold=20, 
+        click_threshold=click_threshold, 
         counter_key='lastChecked_check_apps', 
-        max_apps_to_process=3,
+        max_apps_to_process=max_apps_to_process,
         send_notifications=True,
         notification_base_url=notification_url
     )
@@ -489,26 +628,21 @@ def check_apps_with_notifications():
     json_file = 'https://raw.githubusercontent.com/aditya9738d/codewings_files/main/codewingiTune.json'
     notification_url = request.args.get('notification_url', DEFAULT_NOTIFICATION_URL)
     
-    result = process_apps_from_json(
-        json_file, 
-        click_threshold=10, 
-        counter_key='lastChecked_with_notifications', 
-        max_apps_to_process=3,
-        send_notifications=True,
-        notification_base_url=notification_url
-    )
-    return jsonify(result)
-
-@app.route('/check_all', methods=['GET'])
-def check_all():
-    json_file = 'https://raw.githubusercontent.com/aditya9738d/codewings_files/main/codewingiTune.json'
-    notification_url = request.args.get('notification_url', DEFAULT_NOTIFICATION_URL)
+    try:
+        click_threshold = int(request.args.get('click_threshold', '10'))
+    except (ValueError, TypeError):
+        click_threshold = 10
+        
+    try:
+        max_apps_to_process = int(request.args.get('max_apps_to_process', '3'))
+    except (ValueError, TypeError):
+        max_apps_to_process = 3
     
     result = process_apps_from_json(
         json_file, 
-        click_threshold=0, 
-        counter_key='lastChecked_check_all', 
-        max_apps_to_process=3,
+        click_threshold=click_threshold, 
+        counter_key='lastChecked_with_notifications', 
+        max_apps_to_process=max_apps_to_process,
         send_notifications=True,
         notification_base_url=notification_url
     )
@@ -519,9 +653,14 @@ def daily_stat():
     file_url = 'https://raw.githubusercontent.com/aditya9738d/codewings_files/main/daily-next.md'
     notification_url = request.args.get('notification_url', DEFAULT_NOTIFICATION_URL)
     
+    try:
+        click_threshold = int(request.args.get('click_threshold', '0'))
+    except (ValueError, TypeError):
+        click_threshold = 0
+    
     result = process_apps(
         file_url, 
-        click_threshold=0, 
+        click_threshold=click_threshold, 
         counter_key='lastChecked_dailyNext',
         send_notifications=True,
         notification_base_url=notification_url
@@ -551,11 +690,21 @@ def quick_check():
     json_file = 'https://raw.githubusercontent.com/aditya9738d/codewings_files/main/codewingiTune.json'
     notification_url = request.args.get('notification_url', DEFAULT_NOTIFICATION_URL)
     
+    try:
+        click_threshold = int(request.args.get('click_threshold', '10'))
+    except (ValueError, TypeError):
+        click_threshold = 10
+        
+    try:
+        max_apps_to_process = int(request.args.get('max_apps_to_process', '3'))
+    except (ValueError, TypeError):
+        max_apps_to_process = 3
+    
     result = process_apps_from_json(
         json_file, 
-        click_threshold=10, 
+        click_threshold=click_threshold, 
         counter_key='lastChecked_quick', 
-        max_apps_to_process=3,
+        max_apps_to_process=max_apps_to_process,
         send_notifications=True,
         notification_base_url=notification_url
     )
