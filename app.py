@@ -74,6 +74,107 @@ def fetch_beta_availability(url: str) -> str:
     except requests.exceptions.RequestException as e:
         return 'error'
 
+def fetch_app_info_from_itunes(app_name: str) -> Optional[Dict[str, Any]]:
+    """Fetch app information from iTunes Search API"""
+    try:
+        # Properly encode the app name for URL
+        import urllib.parse
+        encoded_app_name = urllib.parse.quote(app_name)
+        search_url = f"https://itunes.apple.com/search?term={encoded_app_name}&entity=software"
+        search_response = requests.get(search_url, timeout=10)
+        
+        if search_response.status_code == 200:
+            search_data = search_response.json()
+            if search_data['resultCount'] > 0:
+                # Find the best match (partial match if exact not found)
+                for app_info in search_data['results']:
+                    track_name = app_info.get('trackName', '').lower()
+                    if app_name.lower() in track_name:  # Partial match
+                        screenshots = app_info.get("screenshotUrls", [])
+                        features = app_info.get("features", [])
+                        logo_url = app_info.get("artworkUrl100")
+                        logo_url_200 = logo_url.replace('/100x100bb.jpg', '/200x200bb.jpg') if logo_url else ''
+                        app_store_url = app_info.get("trackViewUrl", "")
+                        artist_view_url = app_info.get("artistViewUrl", "")
+                        track_content_rating = app_info.get("contentAdvisoryRating", "")
+                        primary_genre = app_info.get("primaryGenreName", "")
+                        seller_name = app_info.get("sellerName", "")
+                        description = app_info.get("description", "No description available.")
+                        categories = app_info.get("genres", [])
+                        
+                        return {
+                            "name": app_info.get("trackName"),
+                            "description": description,
+                            "developer": app_info.get("artistName"),
+                            "rating": app_info.get("averageUserRating"),
+                            "price": app_info.get("formattedPrice"),
+                            "genres": app_info.get("genres"),
+                            "release_date": app_info.get("releaseDate"),
+                            "screenshotUrls": screenshots,
+                            "features": features,
+                            "artworkUrl100": logo_url,
+                            "logo": logo_url_200,
+                            "appStore": app_store_url,
+                            "artistViewUrl": artist_view_url,
+                            "trackContentRating": track_content_rating,
+                            "primaryGenreName": primary_genre,
+                            "sellerName": seller_name,
+                            "categories": categories
+                        }
+        return None
+    except Exception as e:
+        try:
+            print(f"Error fetching iTunes info for {app_name}: {e}")
+        except UnicodeEncodeError:
+            print(f"Error fetching iTunes info for [App with special characters]: {e}")
+        return None
+
+def enrich_app_with_itunes_data(app_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Enrich app data with iTunes information if missing key details"""
+    # Only fetch iTunes data if app is missing critical information
+    needs_enrichment = (
+        (not app_data.get('screenshotUrls') or len(app_data.get('screenshotUrls', [])) == 0) and
+        (not app_data.get('description') or app_data.get('description') == 'No description available.' or app_data.get('description') == '')
+    )
+    
+    if needs_enrichment:
+        try:
+            print(f"Enriching app data for: {app_data['name']} (missing screenshots and description)")
+        except UnicodeEncodeError:
+            print(f"Enriching app data for: [App with special characters] (missing screenshots and description)")
+        
+        itunes_info = fetch_app_info_from_itunes(app_data['name'])
+        
+        if itunes_info:
+            # Merge iTunes data with existing app data, preferring existing data when available
+            app_data['screenshotUrls'] = app_data.get('screenshotUrls') or itunes_info.get('screenshotUrls', [])
+            app_data['description'] = (app_data.get('description') if app_data.get('description') not in ['No description available.', '', None] 
+                                     else itunes_info.get('description', 'No description available.'))
+            app_data['categories'] = app_data.get('categories') or itunes_info.get('categories', [])
+            app_data['features'] = app_data.get('features') or itunes_info.get('features', [])
+            app_data['appStore'] = app_data.get('appStore') or itunes_info.get('appStore', '')
+            app_data['artistViewUrl'] = app_data.get('artistViewUrl') or itunes_info.get('artistViewUrl', '')
+            app_data['trackContentRating'] = app_data.get('trackContentRating') or itunes_info.get('trackContentRating', '')
+            app_data['primaryGenreName'] = app_data.get('primaryGenreName') or itunes_info.get('primaryGenreName', '')
+            app_data['sellerName'] = app_data.get('sellerName') or itunes_info.get('sellerName', '')
+            app_data['artworkUrl100'] = app_data.get('artworkUrl100') or itunes_info.get('artworkUrl100', '')
+            
+            # Update logo if we got a better quality one from iTunes
+            if not app_data.get('logo') and itunes_info.get('logo'):
+                app_data['logo'] = itunes_info['logo']
+            
+            try:
+                print(f"Successfully enriched app data for: {app_data['name']}")
+            except UnicodeEncodeError:
+                print("Successfully enriched app data for: [App with special characters]")
+        else:
+            try:
+                print(f"Could not fetch iTunes data for: {app_data['name']}")
+            except UnicodeEncodeError:
+                print("Could not fetch iTunes data for: [App with special characters]")
+    
+    return app_data
+
 def get_or_create_app(app_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     sanitized_name = sanitize_string(app_data['name'])
     
@@ -123,8 +224,36 @@ def update_app_status(app_data: Dict[str, Any]) -> Dict[str, Any]:
         current_app = result.data[0]
         previous_status = current_app.get('betaAvailable', 'unknown')
         
-        if (current_app.get('clickCount', 0) == app_data['clickCount'] and 
-            current_app.get('betaAvailable', 'unknown') == app_data['betaAvailable']):
+        # Check if any important data has changed (not just status and clicks)
+        # Normalize values for proper comparison
+        current_screenshots = current_app.get('screenshotUrls') or []
+        new_screenshots = app_data.get('screenshotUrls') or []
+        current_description = current_app.get('description') or ''
+        new_description = app_data.get('description') or ''
+        current_categories = current_app.get('categories') or []
+        new_categories = app_data.get('categories') or []
+        current_features = current_app.get('features') or []
+        new_features = app_data.get('features') or []
+        current_appstore = current_app.get('appStore') or ''
+        new_appstore = app_data.get('appStore') or ''
+        current_artist_url = current_app.get('artistViewUrl') or ''
+        new_artist_url = app_data.get('artistViewUrl') or ''
+        current_logo = current_app.get('logo') or ''
+        new_logo = app_data.get('logo') or ''
+        
+        data_unchanged = (
+            current_app.get('clickCount', 0) == app_data['clickCount'] and 
+            current_app.get('betaAvailable', 'unknown') == app_data['betaAvailable'] and
+            current_screenshots == new_screenshots and
+            current_description == new_description and
+            current_categories == new_categories and
+            current_features == new_features and
+            current_appstore == new_appstore and
+            current_artist_url == new_artist_url and
+            current_logo == new_logo
+        )
+        
+        if data_unchanged:
             return {'updated': False, 'status_changed': False, 'previous_status': previous_status}
         
         status_changed_to_open = (
@@ -138,6 +267,15 @@ def update_app_status(app_data: Dict[str, Any]) -> Dict[str, Any]:
             'link': app_data['link'],
             'logo': app_data['logo'],
             'screenshotUrls': app_data.get('screenshotUrls', []),
+            'description': app_data.get('description', ''),
+            'categories': app_data.get('categories', []),
+            'features': app_data.get('features', []),
+            'appStore': app_data.get('appStore', ''),
+            'artistViewUrl': app_data.get('artistViewUrl', ''),
+            'trackContentRating': app_data.get('trackContentRating', ''),
+            'primaryGenreName': app_data.get('primaryGenreName', ''),
+            'sellerName': app_data.get('sellerName', ''),
+            'artworkUrl100': app_data.get('artworkUrl100', ''),
             'lastChecked': datetime.utcnow().isoformat()
         }
         
@@ -309,6 +447,9 @@ def process_apps_from_api(api_url: str, click_threshold: int, counter_key: str, 
             app = apps_data[app_index].copy()
 
             if app['clickCount'] >= click_threshold:
+                # Enrich app with iTunes data if missing details
+                app = enrich_app_with_itunes_data(app)
+                
                 # App already has betaAvailable status from API, but let's check it fresh
                 app['betaAvailable'] = fetch_beta_availability(app['link'])
                 update_result = update_app_status(app)
@@ -417,6 +558,9 @@ def process_apps_from_json(json_url: str, click_threshold: int, counter_key: str
             app['clickCount'] = user_interactions.get(sanitized_app_name, 0)
 
             if app['clickCount'] >= click_threshold:
+                # Enrich app with iTunes data if missing details
+                app = enrich_app_with_itunes_data(app)
+                
                 app['betaAvailable'] = fetch_beta_availability(app['link'])
                 update_result = update_app_status(app)
                 
@@ -495,7 +639,7 @@ def parse_markdown(markdown_content: str) -> list:
     matches = re.findall(app_pattern, markdown_content)
     return [{"name": match[0], "logo": match[1], "link": match[2]} for match in matches]
 
-def process_apps(file_url: str, click_threshold: int, counter_key: str, send_notifications: bool = False, notification_base_url: str = DEFAULT_NOTIFICATION_URL) -> Dict[str, Any]:
+def process_apps(file_url: str, click_threshold: int, counter_key: str, max_apps_to_check: int = 20, send_notifications: bool = False, notification_base_url: str = DEFAULT_NOTIFICATION_URL) -> Dict[str, Any]:
     try:
         response = requests.get(file_url, timeout=30)
         if not response.text:
@@ -513,13 +657,16 @@ def process_apps(file_url: str, click_threshold: int, counter_key: str, send_not
         count = 0
         apps_to_notify = []
 
-        for i in range(start_index, start_index + 20):
+        for i in range(start_index, start_index + max_apps_to_check):
             app_index = i % len(data)
             app = data[app_index]
             sanitized_app_name = sanitize_string(app['name'])
             app['clickCount'] = user_interactions.get(sanitized_app_name, 0)
 
             if app['clickCount'] >= click_threshold:
+                # Enrich app with iTunes data if missing details
+                app = enrich_app_with_itunes_data(app)
+                
                 app['betaAvailable'] = fetch_beta_availability(app['link'])
                 update_result = update_app_status(app)
                 
@@ -554,7 +701,7 @@ def process_apps(file_url: str, click_threshold: int, counter_key: str, send_not
         if send_notifications and apps_to_notify:
             notification_result = send_telegram_notification(apps_to_notify, notification_base_url)
 
-        new_last_checked_index = (start_index + 20) % len(data)
+        new_last_checked_index = (start_index + max_apps_to_check) % len(data)
         update_processing_index(counter_key, new_last_checked_index)
 
         result = {
@@ -662,6 +809,7 @@ def daily_stat():
         file_url, 
         click_threshold=click_threshold, 
         counter_key='lastChecked_dailyNext',
+        max_apps_to_check=5,
         send_notifications=True,
         notification_base_url=notification_url
     )
@@ -684,6 +832,97 @@ def keep_alive():
         "status": "alive",
         "timestamp": datetime.utcnow().isoformat()
     })
+
+@app.route('/enrich_apps', methods=['GET'])
+def enrich_apps():
+    """Manually enrich apps with iTunes data for apps missing details"""
+    try:
+        notification_url = request.args.get('notification_url', DEFAULT_NOTIFICATION_URL)
+        
+        try:
+            click_threshold = int(request.args.get('click_threshold', '10'))
+        except (ValueError, TypeError):
+            click_threshold = 10
+            
+        try:
+            max_apps_to_process = int(request.args.get('max_apps_to_process', '5'))
+        except (ValueError, TypeError):
+            max_apps_to_process = 5
+        
+        # Get apps from Supabase that need enrichment
+        result = supabase.table('apps')\
+            .select('*')\
+            .gte('clickCount', click_threshold)\
+            .order('clickCount', desc=True)\
+            .limit(max_apps_to_process * 2)\
+            .execute()
+        
+        if not result.data:
+            return jsonify({"message": "No apps found to enrich", "enriched": 0})
+        
+        enriched_count = 0
+        processed_count = 0
+        
+        for app in result.data[:max_apps_to_process]:
+            processed_count += 1
+            
+            # Check if app needs enrichment (only missing critical data)
+            needs_enrichment = (
+                (not app.get('screenshotUrls') or len(app.get('screenshotUrls', [])) == 0) and
+                (not app.get('description') or app.get('description') in ['No description available.', ''])
+            )
+            
+            if needs_enrichment:
+                try:
+                    print(f"Enriching app: {app['name']}")
+                except UnicodeEncodeError:
+                    print("Enriching app: [App with special characters]")
+                
+                # Create app data structure for enrichment
+                app_data = {
+                    'name': app['name'],
+                    'screenshotUrls': app.get('screenshotUrls', []),
+                    'description': app.get('description', ''),
+                    'categories': app.get('categories', []),
+                    'features': app.get('features', []),
+                    'appStore': app.get('appStore', ''),
+                    'artistViewUrl': app.get('artistViewUrl', ''),
+                    'trackContentRating': app.get('trackContentRating', ''),
+                    'primaryGenreName': app.get('primaryGenreName', ''),
+                    'sellerName': app.get('sellerName', ''),
+                    'artworkUrl100': app.get('artworkUrl100', ''),
+                    'logo': app.get('logo', ''),
+                    'link': app.get('link', ''),
+                    'clickCount': app.get('clickCount', 0),
+                    'betaAvailable': app.get('betaAvailable', 'unknown')
+                }
+                
+                # Enrich with iTunes data
+                enriched_app_data = enrich_app_with_itunes_data(app_data)
+                
+                # Update in database if we got new data
+                if enriched_app_data != app_data:
+                    update_result = update_app_status(enriched_app_data)
+                    if update_result['updated']:
+                        enriched_count += 1
+                        try:
+                            print(f"Successfully enriched and saved: {app['name']}")
+                        except UnicodeEncodeError:
+                            print("Successfully enriched and saved: [App with special characters]")
+                
+                time.sleep(0.5)  # Rate limit iTunes API calls
+        
+        return jsonify({
+            "message": f"Enriched {enriched_count} apps out of {processed_count} processed",
+            "details": {
+                "processed": processed_count,
+                "enriched": enriched_count,
+                "click_threshold": click_threshold
+            }
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/quick_check', methods=['GET'])
 def quick_check():
