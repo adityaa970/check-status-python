@@ -1,5 +1,5 @@
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 from flask import Flask, jsonify, request
 import time
@@ -202,7 +202,7 @@ def get_or_create_app(app_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             'primaryGenreName': app_data.get('primaryGenreName', ''),
             'sellerName': app_data.get('sellerName', ''),
             'artworkUrl100': app_data.get('artworkUrl100', ''),
-            'lastChecked': datetime.utcnow().isoformat()
+            'lastChecked': datetime.now(timezone.utc).isoformat()
         }
         
         result = supabase.table('apps').insert(new_app).execute()
@@ -223,6 +223,8 @@ def update_app_status(app_data: Dict[str, Any]) -> Dict[str, Any]:
         
         current_app = result.data[0]
         previous_status = current_app.get('betaAvailable', 'unknown')
+        current_click_count = current_app.get('clickCount', 0)
+        new_click_count = app_data['clickCount']
         
         # Check if any important data has changed (not just status and clicks)
         # Normalize values for proper comparison
@@ -242,7 +244,7 @@ def update_app_status(app_data: Dict[str, Any]) -> Dict[str, Any]:
         new_logo = app_data.get('logo') or ''
         
         data_unchanged = (
-            current_app.get('clickCount', 0) == app_data['clickCount'] and 
+            current_click_count == new_click_count and 
             current_app.get('betaAvailable', 'unknown') == app_data['betaAvailable'] and
             current_screenshots == new_screenshots and
             current_description == new_description and
@@ -263,7 +265,7 @@ def update_app_status(app_data: Dict[str, Any]) -> Dict[str, Any]:
         
         update_data = {
             'betaAvailable': app_data['betaAvailable'],
-            'clickCount': app_data['clickCount'],
+            'clickCount': new_click_count,  # Ensure we're using the new click count
             'link': app_data['link'],
             'logo': app_data['logo'],
             'screenshotUrls': app_data.get('screenshotUrls', []),
@@ -276,16 +278,22 @@ def update_app_status(app_data: Dict[str, Any]) -> Dict[str, Any]:
             'primaryGenreName': app_data.get('primaryGenreName', ''),
             'sellerName': app_data.get('sellerName', ''),
             'artworkUrl100': app_data.get('artworkUrl100', ''),
-            'lastChecked': datetime.utcnow().isoformat()
+            'lastChecked': datetime.now(timezone.utc).isoformat()
         }
         
-        supabase.table('apps').update(update_data).eq('sanitizedName', sanitized_name).execute()
+        update_result = supabase.table('apps').update(update_data).eq('sanitizedName', sanitized_name).execute()
+        
+        if not update_result.data:
+            try:
+                print(f"Warning: No rows updated for app {app_data['name']}")
+            except UnicodeEncodeError:
+                print(f"Warning: No rows updated for app [App with special characters]")
         
         history_entry = {
             'appId': current_app['id'],
             'status': app_data['betaAvailable'],
             'clickCount': app_data['clickCount'],
-            'timestamp': datetime.utcnow().isoformat()
+            'timestamp': datetime.now(timezone.utc).isoformat()
         }
         
         supabase.table('app_history').insert(history_entry).execute()
@@ -306,12 +314,16 @@ def update_app_status(app_data: Dict[str, Any]) -> Dict[str, Any]:
             'status_changed': status_changed_to_open, 
             'previous_status': previous_status,
             'current_status': app_data['betaAvailable'],
-            'click_count': app_data['clickCount'],
+            'click_count': new_click_count,
             'name': app_data['name']
         }
         
     except Exception as e:
-        return {'updated': False, 'status_changed': False, 'previous_status': None}
+        try:
+            print(f"Error updating app status for {app_data.get('name', 'Unknown')}: {str(e)}")
+        except UnicodeEncodeError:
+            print(f"Error updating app status for [App with special characters]: {str(e)}")
+        return {'updated': False, 'status_changed': False, 'previous_status': None, 'error': str(e)}
 
 def check_if_notification_sent(app_name: str, current_status: str, previous_status: str) -> bool:
     """Check if a notification was already sent for this specific status change"""
@@ -341,10 +353,10 @@ def check_if_notification_sent(app_name: str, current_status: str, previous_stat
 def record_notification_sent(app_name: str, current_status: str, previous_status: str) -> None:
     """Record that a notification was sent for this app status change"""
     try:
-        version = f'python_status_change_{previous_status}_to_{current_status}_{datetime.utcnow().isoformat()}'
+        version = f'python_status_change_{previous_status}_to_{current_status}_{datetime.now(timezone.utc).isoformat()}'
         supabase.table('telegram_posts').upsert({
             'appname': app_name,
-            'timestamp': datetime.utcnow().isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             'version': version
         }, {
             'onConflict': 'appname'
@@ -382,14 +394,23 @@ def get_user_interactions() -> Dict[str, int]:
             .limit(1000)\
             .execute()
         
+        if not result.data:
+            print("Warning: No user interactions found")
+            return {}
+        
         interactions = {}
         for item in result.data:
-            interactions[item['sanitizedName']] = item['clickCount']
+            sanitized_name = item.get('sanitizedName')
+            click_count = item.get('clickCount', 0)
+            if sanitized_name:
+                interactions[sanitized_name] = click_count
         
+        print(f"Loaded {len(interactions)} user interactions")
         del result
         
         return interactions
     except Exception as e:
+        print(f"Error fetching user interactions: {str(e)}")
         return {}
 
 
@@ -432,6 +453,12 @@ def process_apps_from_api(api_url: str, click_threshold: int, counter_key: str, 
 
         apps_data = data['apps']
         
+        # Get current user interactions for accurate click counts
+        user_interactions = get_user_interactions()
+        
+        if not user_interactions:
+            return {"error": "No user interactions found - cannot determine click counts"}
+        
         start_index = get_processing_index(counter_key)
         
         total_apps = len(apps_data)
@@ -441,10 +468,24 @@ def process_apps_from_api(api_url: str, click_threshold: int, counter_key: str, 
         apps_to_notify = []
 
         max_check_limit = min(max_apps_to_process * 5, total_apps)
+        try:
+            print(f"process_apps_from_api: total_apps={total_apps}, start_index={start_index}, max_check_limit={max_check_limit}, max_apps_to_process={max_apps_to_process}")
+        except Exception:
+            pass
         
         while count < max_apps_to_process and checked < max_check_limit and checked < total_apps:
             app_index = (start_index + checked) % total_apps
             app = apps_data[app_index].copy()
+
+            # Update click count from user_interactions instead of using stale API data
+            sanitized_app_name = sanitize_string(app.get('name', ''))
+            api_click = app.get('clickCount', 0)
+            user_click = user_interactions.get(sanitized_app_name, 0)
+            app['clickCount'] = user_click
+            try:
+                print(f"Checking app index={app_index} name={app.get('name')} sanitized={sanitized_app_name} api_click={api_click} user_click={user_click}")
+            except Exception:
+                pass
 
             if app['clickCount'] >= click_threshold:
                 # Enrich app with iTunes data if missing details
@@ -481,11 +522,22 @@ def process_apps_from_api(api_url: str, click_threshold: int, counter_key: str, 
                             update_result['previous_status']
                         )
                 
+                try:
+                    if update_result.get('updated'):
+                        print(f"Updated {app.get('name')} -> clickCount {user_click}")
+                    else:
+                        print(f"No update for {app.get('name')} (unchanged)")
+                except Exception:
+                    pass
                 import gc
                 gc.collect()
                 time.sleep(1.0)
             else:
                 apps_below_threshold += 1
+                try:
+                    print(f"Skipped {app.get('name')} below threshold (clicks={app['clickCount']})")
+                except Exception:
+                    pass
 
             checked += 1
             del app
@@ -495,6 +547,7 @@ def process_apps_from_api(api_url: str, click_threshold: int, counter_key: str, 
             notification_result = send_telegram_notification(apps_to_notify, notification_base_url)
 
         del data
+        del user_interactions
         
         import gc
         gc.collect()
@@ -539,7 +592,7 @@ def process_apps_from_json(json_url: str, click_threshold: int, counter_key: str
         user_interactions = get_user_interactions()
         
         if not user_interactions:
-            return {"error": "No user interactions found"}
+            return {"error": "No user interactions found - cannot determine click counts"}
         
         start_index = get_processing_index(counter_key)
         
@@ -565,6 +618,13 @@ def process_apps_from_json(json_url: str, click_threshold: int, counter_key: str
                 update_result = update_app_status(app)
                 
                 count += 1  # Count all qualifying apps, not just updated ones
+                
+                # Log only errors
+                if 'error' in update_result:
+                    try:
+                        print(f"Failed to update {app['name']}: {update_result.get('error')}")
+                    except UnicodeEncodeError:
+                        print(f"Failed to update [App with special characters]: {update_result.get('error')}")
                 
                 if update_result['updated']:
                     # Only send notification if status changed to open AND we haven't already notified about this change
@@ -821,7 +881,7 @@ def health():
     gc.collect()
     return jsonify({
         "status": "healthy", 
-        "timestamp": datetime.utcnow().isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat()
     })
 
 @app.route('/keep_alive', methods=['GET'])
@@ -830,7 +890,7 @@ def keep_alive():
     gc.collect()
     return jsonify({
         "status": "alive",
-        "timestamp": datetime.utcnow().isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat()
     })
 
 @app.route('/enrich_apps', methods=['GET'])
