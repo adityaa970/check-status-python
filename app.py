@@ -364,6 +364,42 @@ def record_notification_sent(app_name: str, current_status: str, previous_status
     except Exception as e:
         pass
 
+def send_email_notification(apps_to_notify: list, base_url: str = DEFAULT_NOTIFICATION_URL) -> Dict[str, Any]:
+    try:
+        if not apps_to_notify:
+            return {'success': False, 'message': 'No apps to notify via email'}
+        
+        api_url = f"{base_url}/api/sendEmailToList"
+        
+        # Format apps data for email notification
+        email_apps = []
+        for app in apps_to_notify:
+            email_app = {
+                'name': app['name'],
+                'betaAvailable': app.get('betaAvailable', app.get('status', 'open')),
+                'clickCount': app.get('clickCount', 0),
+                'categories': app.get('categories', []),
+                'logo': app.get('logo', ''),
+                'timestamp': app.get('timestamp', datetime.now(timezone.utc).isoformat())
+            }
+            email_apps.append(email_app)
+        
+        payload = {
+            'apps': email_apps
+        }
+        
+        response = requests.post(api_url, json=payload, timeout=30)
+        
+        if response.status_code == 200:
+            return {'success': True, 'data': response.json(), 'sent_count': len(apps_to_notify)}
+        else:
+            return {'success': False, 'error': f'HTTP {response.status_code}', 'response': response.text}
+            
+    except requests.exceptions.RequestException as e:
+        return {'success': False, 'error': str(e)}
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
 def send_telegram_notification(apps_to_notify: list, base_url: str = DEFAULT_NOTIFICATION_URL) -> Dict[str, Any]:
     try:
         if not apps_to_notify:
@@ -512,7 +548,10 @@ def process_apps_from_api(api_url: str, click_threshold: int, counter_key: str, 
                             'name': app['name'],
                             'clickCount': app['clickCount'],
                             'betaAvailable': app['betaAvailable'],
-                            'previousStatus': update_result['previous_status']
+                            'previousStatus': update_result['previous_status'],
+                            'categories': app.get('categories', []),
+                            'logo': app.get('logo', ''),
+                            'timestamp': datetime.now(timezone.utc).isoformat()
                         })
                         
                         # Record that we're about to send a notification for this change
@@ -543,8 +582,10 @@ def process_apps_from_api(api_url: str, click_threshold: int, counter_key: str, 
             del app
 
         notification_result = None
+        email_notification_result = None
         if send_notifications and apps_to_notify:
             notification_result = send_telegram_notification(apps_to_notify, notification_base_url)
+            email_notification_result = send_email_notification(apps_to_notify, notification_base_url)
 
         del data
         del user_interactions
@@ -567,7 +608,10 @@ def process_apps_from_api(api_url: str, click_threshold: int, counter_key: str, 
         }
         
         if notification_result:
-            result["notification_result"] = notification_result
+            result["telegram_notification"] = notification_result
+            
+        if email_notification_result:
+            result["email_notification"] = email_notification_result
             
         return result
         
@@ -641,7 +685,10 @@ def process_apps_from_json(json_url: str, click_threshold: int, counter_key: str
                             'name': app['name'],
                             'clickCount': app['clickCount'],
                             'betaAvailable': app['betaAvailable'],
-                            'previousStatus': update_result['previous_status']
+                            'previousStatus': update_result['previous_status'],
+                            'categories': app.get('categories', []),
+                            'logo': app.get('logo', ''),
+                            'timestamp': datetime.now(timezone.utc).isoformat()
                         })
                         
                         # Record that we're about to send a notification for this change
@@ -661,8 +708,10 @@ def process_apps_from_json(json_url: str, click_threshold: int, counter_key: str
             del app
 
         notification_result = None
+        email_notification_result = None
         if send_notifications and apps_to_notify:
             notification_result = send_telegram_notification(apps_to_notify, notification_base_url)
+            email_notification_result = send_email_notification(apps_to_notify, notification_base_url)
 
         del data
         del user_interactions
@@ -685,7 +734,10 @@ def process_apps_from_json(json_url: str, click_threshold: int, counter_key: str
         }
         
         if notification_result:
-            result["notification_result"] = notification_result
+            result["telegram_notification"] = notification_result
+            
+        if email_notification_result:
+            result["email_notification"] = email_notification_result
             
         return result
         
@@ -747,7 +799,10 @@ def process_apps(file_url: str, click_threshold: int, counter_key: str, max_apps
                             'name': app['name'],
                             'clickCount': app['clickCount'],
                             'betaAvailable': app['betaAvailable'],
-                            'previousStatus': update_result['previous_status']
+                            'previousStatus': update_result['previous_status'],
+                            'categories': app.get('categories', []),
+                            'logo': app.get('logo', ''),
+                            'timestamp': datetime.now(timezone.utc).isoformat()
                         })
                         
                         # Record that we're about to send a notification for this change
@@ -758,8 +813,11 @@ def process_apps(file_url: str, click_threshold: int, counter_key: str, max_apps
                         )
 
         notification_result = None
+        email_notification_result = None
         if send_notifications and apps_to_notify:
+            # Send both Telegram and Email notifications
             notification_result = send_telegram_notification(apps_to_notify, notification_base_url)
+            email_notification_result = send_email_notification(apps_to_notify, notification_base_url)
 
         new_last_checked_index = (start_index + max_apps_to_check) % len(data)
         update_processing_index(counter_key, new_last_checked_index)
@@ -773,7 +831,10 @@ def process_apps(file_url: str, click_threshold: int, counter_key: str, max_apps
         }
         
         if notification_result:
-            result["notification_result"] = notification_result
+            result["telegram_notification"] = notification_result
+            
+        if email_notification_result:
+            result["email_notification"] = email_notification_result
             
         return result
         
