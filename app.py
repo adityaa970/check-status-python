@@ -425,24 +425,40 @@ def send_telegram_notification(apps_to_notify: list, base_url: str = DEFAULT_NOT
 
 def get_user_interactions() -> Dict[str, int]:
     try:
-        result = supabase.table('user_interactions')\
-            .select('sanitizedName, clickCount')\
-            .limit(1000)\
-            .execute()
+        # Fetch ALL user interactions without limit using pagination
+        all_interactions = []
+        page_size = 1000
+        page = 0
         
-        if not result.data:
+        while True:
+            result = supabase.table('user_interactions')\
+                .select('sanitizedName, clickCount')\
+                .order('clickCount', desc=True)\
+                .range(page * page_size, (page + 1) * page_size - 1)\
+                .execute()
+            
+            if not result.data or len(result.data) == 0:
+                break
+                
+            all_interactions.extend(result.data)
+            
+            if len(result.data) < page_size:
+                break
+                
+            page += 1
+        
+        if not all_interactions:
             print("Warning: No user interactions found")
             return {}
         
         interactions = {}
-        for item in result.data:
+        for item in all_interactions:
             sanitized_name = item.get('sanitizedName')
             click_count = item.get('clickCount', 0)
             if sanitized_name:
                 interactions[sanitized_name] = click_count
         
-        print(f"Loaded {len(interactions)} user interactions")
-        del result
+        print(f"Loaded {len(interactions)} user interactions (all data)")
         
         return interactions
     except Exception as e:
@@ -503,7 +519,7 @@ def process_apps_from_api(api_url: str, click_threshold: int, counter_key: str, 
         apps_below_threshold = 0
         apps_to_notify = []
 
-        max_check_limit = min(max_apps_to_process * 5, total_apps)
+        max_check_limit = min(max_apps_to_process * 3, total_apps)
         try:
             print(f"process_apps_from_api: total_apps={total_apps}, start_index={start_index}, max_check_limit={max_check_limit}, max_apps_to_process={max_apps_to_process}")
         except Exception:
@@ -646,7 +662,7 @@ def process_apps_from_json(json_url: str, click_threshold: int, counter_key: str
         apps_below_threshold = 0
         apps_to_notify = []
 
-        max_check_limit = min(max_apps_to_process * 5, total_apps)
+        max_check_limit = min(max_apps_to_process * 3, total_apps)
         
         while count < max_apps_to_process and checked < max_check_limit and checked < total_apps:
             app_index = (start_index + checked) % total_apps
@@ -877,9 +893,9 @@ def check_apps():
         click_threshold = 20
         
     try:
-        max_apps_to_process = int(request.args.get('max_apps_to_process', '3'))
+        max_apps_to_process = int(request.args.get('max_apps_to_process', '50'))
     except (ValueError, TypeError):
-        max_apps_to_process = 3
+        max_apps_to_process = 50
     
     result = process_apps_from_json(
         json_file, 
@@ -902,9 +918,9 @@ def check_apps_with_notifications():
         click_threshold = 10
         
     try:
-        max_apps_to_process = int(request.args.get('max_apps_to_process', '3'))
+        max_apps_to_process = int(request.args.get('max_apps_to_process', '50'))
     except (ValueError, TypeError):
-        max_apps_to_process = 3
+        max_apps_to_process = 50
     
     result = process_apps_from_json(
         json_file, 
@@ -1045,6 +1061,83 @@ def enrich_apps():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route('/sync_all_click_counts', methods=['GET'])
+def sync_all_click_counts():
+    """Sync ALL click counts from user_interactions to apps table"""
+    try:
+        print("Starting full click count synchronization...")
+        
+        # Get all user interactions
+        user_interactions = get_user_interactions()
+        if not user_interactions:
+            return jsonify({"error": "No user interactions found"}), 500
+        
+        # Get all apps that need updating
+        result = supabase.table('apps')\
+            .select('id, name, sanitizedName, clickCount')\
+            .execute()
+        
+        if not result.data:
+            return jsonify({"error": "No apps found"}), 500
+        
+        apps_to_update = []
+        for app in result.data:
+            sanitized_name = app['sanitizedName']
+            current_clicks = app.get('clickCount', 0)
+            new_clicks = user_interactions.get(sanitized_name, 0)
+            
+            if new_clicks != current_clicks:
+                apps_to_update.append({
+                    'id': app['id'],
+                    'name': app['name'],
+                    'sanitizedName': sanitized_name,
+                    'old_clicks': current_clicks,
+                    'new_clicks': new_clicks
+                })
+        
+        if not apps_to_update:
+            return jsonify({
+                "message": "All click counts are already synchronized",
+                "apps_checked": len(result.data),
+                "apps_updated": 0
+            })
+        
+        # Update in batches
+        updated_count = 0
+        batch_size = 100
+        
+        for i in range(0, len(apps_to_update), batch_size):
+            batch = apps_to_update[i:i + batch_size]
+            
+            for app in batch:
+                try:
+                    update_result = supabase.table('apps')\
+                        .update({\
+                            'clickCount': app['new_clicks'],\
+                            'lastChecked': datetime.now(timezone.utc).isoformat()\
+                        })\
+                        .eq('id', app['id'])\
+                        .execute()
+                    
+                    if update_result.data:
+                        updated_count += 1
+                        
+                except Exception as e:
+                    print(f"Error updating {app['name']}: {str(e)}")
+        
+        return jsonify({
+            "message": f"Successfully synchronized {updated_count} apps",
+            "details": {
+                "apps_checked": len(result.data),
+                "apps_needing_update": len(apps_to_update),
+                "apps_updated": updated_count,
+                "user_interactions_loaded": len(user_interactions)
+            }
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/quick_check', methods=['GET'])
 def quick_check():
     json_file = 'https://raw.githubusercontent.com/aditya9738d/codewings_files/main/codewingiTune.json'
@@ -1056,9 +1149,9 @@ def quick_check():
         click_threshold = 10
         
     try:
-        max_apps_to_process = int(request.args.get('max_apps_to_process', '3'))
+        max_apps_to_process = int(request.args.get('max_apps_to_process', '30'))
     except (ValueError, TypeError):
-        max_apps_to_process = 3
+        max_apps_to_process = 30
     
     result = process_apps_from_json(
         json_file, 
