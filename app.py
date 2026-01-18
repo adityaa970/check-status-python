@@ -859,7 +859,7 @@ def process_apps(file_url: str, click_threshold: int, counter_key: str, max_apps
 
 @app.route('/check_supabase_api', methods=['GET'])
 def check_supabase_api():
-    api_url = 'https://telegram-js-xi.vercel.app/api/codewingFinalSupabase?cct=20'
+    api_url = 'https://telegram-js-xi.vercel.app/api/codewingFinalSupabase?cct=80'
     notification_url = request.args.get('notification_url', DEFAULT_NOTIFICATION_URL)
     
     try:
