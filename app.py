@@ -12,7 +12,7 @@ app = Flask(__name__)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL") or "https://cuqnpzoldeiztgezwqqe.supabase.co"
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImN1cW5wem9sZGVpenRnZXp3cXFlIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MTMwOTM3OSwiZXhwIjoyMDc2ODg1Mzc5fQ.Ltm4bRsX8UBOG5XuXLEciniGohs1Bvz6iHoPJqT8k8I"
-DEFAULT_NOTIFICATION_URL = "https://telegram-js-xi.vercel.app"
+DEFAULT_NOTIFICATION_URL = "https://api.codewing.in"
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise ValueError("Missing Supabase environment variables")
@@ -20,21 +20,22 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 def sanitize_string(s: str) -> str:
-    import urllib.parse
-    
+    """Natural Unicode-aware sanitization matching the JS implementation."""
     if not s:
-        return ''
+        return ""
     
-    has_non_english = bool(re.search(r'[^\x00-\x7F]', s))
+    # Lowercase
+    res = s.lower()
+    # Replace spaces with dashes
+    res = res.replace(" ", "-")
+    # Keep letters (Unicode aware), numbers, and dashes. Replace everything else with a dash.
+    # In Python, \w includes Unicode letters/numbers. We explicitly remove underscores.
+    res = re.sub(r'[^\w-]', '-', res)
+    res = res.replace("_", "-")
     
-    if has_non_english:
-        return urllib.parse.quote(s, safe='')
-    else:
-        result = s.lower()
-        result = re.sub(r'\s+', '-', result)
-        result = re.sub(r'[^\w\s-]', '-', result)
-        result = re.sub(r'-+', '-', result)
-        return result.strip('-')
+    # Collapse multiple dashes and trim
+    res = re.sub(r'-+', '-', res)
+    return res.strip('-')
 
 def fetch_beta_availability(url: str) -> str:
     try:
@@ -474,6 +475,92 @@ def get_processing_index(counter_key: str) -> int:
     except Exception as e:
         return 0
 
+def process_apps_from_supabase(click_threshold: int, counter_key: str, max_apps_to_process: int = 5, send_notifications: bool = False, notification_base_url: str = DEFAULT_NOTIFICATION_URL) -> Dict[str, Any]:
+    """Fetch and process apps directly from Supabase, focusing on high-click apps to keep usage low."""
+    try:
+        # Get apps from Supabase that meet the click threshold
+        # We order by clickCount to prioritize active apps
+        query = supabase.table('apps')\
+            .select('*')\
+            .gte('clickCount', click_threshold)\
+            .order('clickCount', desc=True)
+            
+        result = query.execute()
+        
+        if not result.data:
+            return {"message": "No apps found in Supabase meeting the threshold", "processed": 0}
+
+        apps_data = result.data
+        total_apps = len(apps_data)
+        
+        start_index = get_processing_index(counter_key)
+        count = 0
+        checked = 0
+        apps_to_notify = []
+
+        # Only process a small batch at a time
+        while count < max_apps_to_process and checked < total_apps:
+            app_index = (start_index + checked) % total_apps
+            app = apps_data[app_index]
+            
+            try:
+                print(f"Checking app: {app.get('name')} (clicks: {app.get('clickCount')})")
+            except Exception:
+                pass
+
+            # Re-check beta availability
+            app['betaAvailable'] = fetch_beta_availability(app['link'])
+            
+            # Enrich with iTunes data if missing critical details
+            # app = enrich_app_with_itunes_data(app)
+            
+            update_result = update_app_status(app)
+            
+            if update_result['updated'] and update_result['status_changed'] and update_result['current_status'] == 'open':
+                if send_notifications and not check_if_notification_sent(app['name'], 'open', update_result['previous_status']):
+                    apps_to_notify.append({
+                        'name': app['name'],
+                        'clickCount': app['clickCount'],
+                        'betaAvailable': 'open',
+                        'previousStatus': update_result['previous_status'],
+                        'categories': app.get('categories', []),
+                        'logo': app.get('logo', ''),
+                        'timestamp': datetime.now(timezone.utc).isoformat()
+                    })
+                    record_notification_sent(app['name'], 'open', update_result['previous_status'])
+
+            count += 1
+            checked += 1
+            
+            # Rate limiting for scraping/API calls
+            time.sleep(1.0)
+            import gc
+            gc.collect()
+
+        # Handle notifications
+        telegram_res = None
+        email_res = None
+        if send_notifications and apps_to_notify:
+            telegram_res = send_telegram_notification(apps_to_notify, notification_base_url)
+            email_res = send_email_notification(apps_to_notify, notification_base_url)
+
+        # Update index for next run
+        new_index = (start_index + checked) % total_apps
+        update_processing_index(counter_key, new_index)
+
+        return {
+            "message": f"Processed {count} apps from Supabase for {counter_key}.",
+            "details": {
+                "checked": checked,
+                "processed": count,
+                "notifications_sent": len(apps_to_notify)
+            },
+            "telegram": telegram_res,
+            "email": email_res
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
 def update_processing_index(counter_key: str, last_checked: int) -> None:
     try:
         result = supabase.table('processing_indexes')\
@@ -541,7 +628,7 @@ def process_apps_from_api(api_url: str, click_threshold: int, counter_key: str, 
 
             if app['clickCount'] >= click_threshold:
                 # Enrich app with iTunes data if missing details
-                app = enrich_app_with_itunes_data(app)
+                # app = enrich_app_with_itunes_data(app)
                 
                 # App already has betaAvailable status from API, but let's check it fresh
                 app['betaAvailable'] = fetch_beta_availability(app['link'])
@@ -672,7 +759,7 @@ def process_apps_from_json(json_url: str, click_threshold: int, counter_key: str
 
             if app['clickCount'] >= click_threshold:
                 # Enrich app with iTunes data if missing details
-                app = enrich_app_with_itunes_data(app)
+                # app = enrich_app_with_itunes_data(app)
                 
                 app['betaAvailable'] = fetch_beta_availability(app['link'])
                 update_result = update_app_status(app)
@@ -793,7 +880,7 @@ def process_apps(file_url: str, click_threshold: int, counter_key: str, max_apps
 
             if app['clickCount'] >= click_threshold:
                 # Enrich app with iTunes data if missing details
-                app = enrich_app_with_itunes_data(app)
+                # app = enrich_app_with_itunes_data(app)
                 
                 app['betaAvailable'] = fetch_beta_availability(app['link'])
                 update_result = update_app_status(app)
@@ -859,7 +946,6 @@ def process_apps(file_url: str, click_threshold: int, counter_key: str, max_apps
 
 @app.route('/check_supabase_api', methods=['GET'])
 def check_supabase_api():
-    api_url = 'https://telegram-js-xi.vercel.app/api/codewingFinalSupabase?cct=80'
     notification_url = request.args.get('notification_url', DEFAULT_NOTIFICATION_URL)
     
     try:
@@ -872,10 +958,9 @@ def check_supabase_api():
     except (ValueError, TypeError):
         max_apps_to_process = 3
     
-    result = process_apps_from_api(
-        api_url, 
+    result = process_apps_from_supabase(
         click_threshold=click_threshold, 
-        counter_key='lastChecked_supabase_api', 
+        counter_key='supabase_api_check', 
         max_apps_to_process=max_apps_to_process,
         send_notifications=True,
         notification_base_url=notification_url
@@ -884,7 +969,6 @@ def check_supabase_api():
 
 @app.route('/check_apps', methods=['GET'])
 def check_apps():
-    json_file = 'https://raw.githubusercontent.com/aditya9738d/codewings_files/main/codewingiTune.json'
     notification_url = request.args.get('notification_url', DEFAULT_NOTIFICATION_URL)
     
     try:
@@ -893,14 +977,13 @@ def check_apps():
         click_threshold = 20
         
     try:
-        max_apps_to_process = int(request.args.get('max_apps_to_process', '50'))
+        max_apps_to_process = int(request.args.get('max_apps_to_process', '5'))
     except (ValueError, TypeError):
-        max_apps_to_process = 50
+        max_apps_to_process = 5
     
-    result = process_apps_from_json(
-        json_file, 
+    result = process_apps_from_supabase(
         click_threshold=click_threshold, 
-        counter_key='lastChecked_check_apps', 
+        counter_key='supabase_check_apps', 
         max_apps_to_process=max_apps_to_process,
         send_notifications=True,
         notification_base_url=notification_url
@@ -909,7 +992,6 @@ def check_apps():
 
 @app.route('/check_apps_with_notifications', methods=['GET'])
 def check_apps_with_notifications():
-    json_file = 'https://raw.githubusercontent.com/aditya9738d/codewings_files/main/codewingiTune.json'
     notification_url = request.args.get('notification_url', DEFAULT_NOTIFICATION_URL)
     
     try:
@@ -918,14 +1000,13 @@ def check_apps_with_notifications():
         click_threshold = 10
         
     try:
-        max_apps_to_process = int(request.args.get('max_apps_to_process', '50'))
+        max_apps_to_process = int(request.args.get('max_apps_to_process', '10'))
     except (ValueError, TypeError):
-        max_apps_to_process = 50
+        max_apps_to_process = 10
     
-    result = process_apps_from_json(
-        json_file, 
+    result = process_apps_from_supabase(
         click_threshold=click_threshold, 
-        counter_key='lastChecked_with_notifications', 
+        counter_key='supabase_notifications_check', 
         max_apps_to_process=max_apps_to_process,
         send_notifications=True,
         notification_base_url=notification_url
@@ -934,19 +1015,17 @@ def check_apps_with_notifications():
 
 @app.route('/daily_stat', methods=['GET'])
 def daily_stat():
-    file_url = 'https://raw.githubusercontent.com/aditya9738d/codewings_files/main/daily-next.md'
     notification_url = request.args.get('notification_url', DEFAULT_NOTIFICATION_URL)
     
     try:
-        click_threshold = int(request.args.get('click_threshold', '0'))
+        click_threshold = int(request.args.get('click_threshold', '5'))
     except (ValueError, TypeError):
-        click_threshold = 0
+        click_threshold = 5
     
-    result = process_apps(
-        file_url, 
+    result = process_apps_from_supabase(
         click_threshold=click_threshold, 
-        counter_key='lastChecked_dailyNext',
-        max_apps_to_check=5,
+        counter_key='supabase_daily_stat',
+        max_apps_to_process=3,
         send_notifications=True,
         notification_base_url=notification_url
     )
@@ -1140,7 +1219,6 @@ def sync_all_click_counts():
 
 @app.route('/quick_check', methods=['GET'])
 def quick_check():
-    json_file = 'https://raw.githubusercontent.com/aditya9738d/codewings_files/main/codewingiTune.json'
     notification_url = request.args.get('notification_url', DEFAULT_NOTIFICATION_URL)
     
     try:
@@ -1149,14 +1227,13 @@ def quick_check():
         click_threshold = 10
         
     try:
-        max_apps_to_process = int(request.args.get('max_apps_to_process', '30'))
+        max_apps_to_process = int(request.args.get('max_apps_to_process', '10'))
     except (ValueError, TypeError):
-        max_apps_to_process = 30
+        max_apps_to_process = 10
     
-    result = process_apps_from_json(
-        json_file, 
+    result = process_apps_from_supabase(
         click_threshold=click_threshold, 
-        counter_key='lastChecked_quick', 
+        counter_key='supabase_quick_check', 
         max_apps_to_process=max_apps_to_process,
         send_notifications=True,
         notification_base_url=notification_url
