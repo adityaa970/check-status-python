@@ -479,9 +479,11 @@ def process_apps_from_supabase(click_threshold: int, counter_key: str, max_apps_
     """Fetch and process apps directly from Supabase, focusing on high-click apps to keep usage low."""
     try:
         # Get apps from Supabase that meet the click threshold
-        # We order by clickCount to prioritize active apps
+        # We only fetch necessary columns to minimize Supabase egress (data usage)
+        # We skip 'description' and 'screenshotUrls' as they are not needed for status checks
+        fields = 'id, name, link, betaAvailable, clickCount, sanitizedName, categories, logo, lastChecked'
         query = supabase.table('apps')\
-            .select('*')\
+            .select(fields)\
             .gte('clickCount', click_threshold)\
             .order('clickCount', desc=True)
             
