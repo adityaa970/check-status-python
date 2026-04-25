@@ -1033,6 +1033,30 @@ def daily_stat():
     )
     return jsonify(result)
 
+@app.route('/check_high_clicks', methods=['GET'])
+def check_high_clicks():
+    notification_url = request.args.get('notification_url', DEFAULT_NOTIFICATION_URL)
+    
+    try:
+        # Default to 500 as requested
+        click_threshold = int(request.args.get('click_threshold', '500'))
+    except (ValueError, TypeError):
+        click_threshold = 500
+        
+    try:
+        max_apps_to_process = int(request.args.get('max_apps_to_process', '5'))
+    except (ValueError, TypeError):
+        max_apps_to_process = 5
+    
+    result = process_apps_from_supabase(
+        click_threshold=click_threshold, 
+        counter_key='supabase_high_click_check', 
+        max_apps_to_process=max_apps_to_process,
+        send_notifications=True,
+        notification_base_url=notification_url
+    )
+    return jsonify(result)
+
 @app.route('/health', methods=['GET'])
 def health():
     import gc
