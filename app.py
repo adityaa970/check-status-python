@@ -10,8 +10,8 @@ from typing import Dict, Any, Optional
 
 app = Flask(__name__)
 
-SUPABASE_URL = os.getenv("SUPABASE_URL") or "https://cuqnpzoldeiztgezwqqe.supabase.co"
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImN1cW5wem9sZGVpenRnZXp3cXFlIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MTMwOTM3OSwiZXhwIjoyMDc2ODg1Mzc5fQ.Ltm4bRsX8UBOG5XuXLEciniGohs1Bvz6iHoPJqT8k8I"
+SUPABASE_URL = os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL") or "https://fmsfrwktlsqdwwcqyrna.supabase.co"
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZtc2Zyd2t0bHNxZHd3Y3F5cm5hIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzU4ODQ5MjEsImV4cCI6MjA5MTQ2MDkyMX0.oMjhKiwqaXw-Vkml8lgt3HC5IH2T65voR1Y7Hl2wg6o"
 DEFAULT_NOTIFICATION_URL = "https://api.codewing.in"
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
