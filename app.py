@@ -471,8 +471,9 @@ def get_user_interactions() -> Dict[str, int]:
 def get_processing_index(counter_key: str) -> int:
     try:
         result = supabase.table('processing_indexes').select('lastChecked').eq('counterKey', counter_key).execute()
-        return result.data[0]['lastChecked'] if result.data else 0
+        return result.data[0]['lastChecked'] if (hasattr(result, 'data') and result.data) else 0
     except Exception as e:
+        print(f"Error getting processing index for {counter_key}: {e}")
         return 0
 
 def process_apps_from_supabase(click_threshold: int, counter_key: str, max_apps_to_process: int = 5, send_notifications: bool = False, notification_base_url: str = DEFAULT_NOTIFICATION_URL) -> Dict[str, Any]:
@@ -565,19 +566,19 @@ def process_apps_from_supabase(click_threshold: int, counter_key: str, max_apps_
 
 def update_processing_index(counter_key: str, last_checked: int) -> None:
     try:
-        result = supabase.table('processing_indexes')\
-            .update({'lastChecked': last_checked})\
-            .eq('counterKey', counter_key)\
-            .execute()
-        
-        if not result.data:
+        res = supabase.table('processing_indexes').select('counterKey').eq('counterKey', counter_key).execute()
+        if hasattr(res, 'data') and res.data:
+            supabase.table('processing_indexes').update({'lastChecked': last_checked}).eq('counterKey', counter_key).execute()
+            print(f"Updated index {counter_key} to {last_checked}")
+        else:
             supabase.table('processing_indexes').insert({
                 'counterKey': counter_key,
                 'lastChecked': last_checked
             }).execute()
+            print(f"Inserted new index {counter_key} at {last_checked}")
             
     except Exception as e:
-        pass
+        print(f"Error updating processing_indexes for {counter_key}: {e}")
 
 def process_apps_from_api(api_url: str, click_threshold: int, counter_key: str, max_apps_to_process: int = 1, send_notifications: bool = False, notification_base_url: str = DEFAULT_NOTIFICATION_URL) -> Dict[str, Any]:
     try:
